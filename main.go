@@ -16,27 +16,41 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
+
+	"github.com/spf13/pflag"
 )
 
-//go:embed palettes/**.pal
-var palettes embed.FS
+type Command struct {
+	Desc  string
+	Usage string
+	Doc   string
+}
 
+const (
+	IDENTIFY = "identify"
+	REMAP    = "remap"
+	LIST     = "list"
+	HELP     = "help"
+)
+
+var (
+	//go:embed palettes/**.pal
+	palettes embed.FS
+	ex       string
+)
+
+// TODO: Make tests
 // TODO: Detect wrong types of .pal
 
 // Extracts the color palette from an NES/FAMICOM pal file
 // will not work with pal files for other uses
-func load_palette(path string) (color.Palette, error) {
-	file, err := os.Open(path)
-	if err != nil {
-		file.Close()
-		return nil, err
-	}
-	defer file.Close()
+func load_palette(pal io.Reader) (color.Palette, error) {
 	const PALETTE_SIZE = 64
 
 	// NES color palette has 64 colors in RGB format
 	data := make([]byte, PALETTE_SIZE*3)
-	_, err = io.ReadFull(file, data)
+	_, err := io.ReadFull(pal, data)
 	if err != nil {
 		return nil, err
 	}
@@ -93,9 +107,26 @@ func has_palette(img image.Image, p color.Palette) bool {
 	return true
 }
 
-func identify(img image.Image) (int, error) {
-	dir := "palettes"
-	entries, err := palettes.ReadDir(dir)
+func identify(img image.Image, custom_pals []*os.File, custom_only bool) (int, error) {
+	for _, pal := range custom_pals {
+		p, err := load_palette(pal)
+		if err != nil {
+			return 1, err
+		}
+
+		if has_palette(img, p) {
+			println("The palette used in this image was:", strings.TrimSuffix(pal.Name(), ".pal"))
+			return 0, nil
+		}
+	}
+
+	if custom_only && len(custom_pals) > 0 {
+		return 0, nil
+	} else if custom_only {
+		return 2, fmt.Errorf("%s: flag 'custom-only' reguires input color palettes", ex)
+	}
+
+	entries, err := fs.ReadDir(palettes, "palettes")
 	if err != nil {
 		return 1, err
 	}
@@ -105,8 +136,12 @@ func identify(img image.Image) (int, error) {
 		if entry.IsDir() || filepath.Ext(filename) != ".pal" {
 			continue
 		}
+		file, err := palettes.Open(filepath.Join("palettes", filename))
+		if err != nil {
+			return 1, err
+		}
 
-		p, err := load_palette(filepath.Join(dir, entry.Name()))
+		p, err := load_palette(file)
 		if err != nil {
 			return 1, err
 		}
@@ -121,13 +156,13 @@ func identify(img image.Image) (int, error) {
 	return 0, nil
 }
 
-func remap(img image.Image) (int, error) {
-	palette, err := load_palette(os.Args[3])
+func remap(img image.Image, pal io.Reader, dst_path string) (int, error) {
+	p, err := load_palette(pal)
 	if err != nil {
 		return 1, err
 	}
 
-	remappedf, err := os.Create(os.Args[4])
+	remappedf, err := os.Create(dst_path)
 	if err != nil {
 		remappedf.Close()
 		return 1, err
@@ -139,7 +174,7 @@ func remap(img image.Image) (int, error) {
 
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			remapped.Set(x, y, find_closest(img.At(x, y), palette))
+			remapped.Set(x, y, find_closest(img.At(x, y), p))
 		}
 	}
 
@@ -158,71 +193,56 @@ func remap(img image.Image) (int, error) {
 	return 0, nil
 }
 
-func run() int {
-	log.SetFlags(0)
-
-	ex, err := os.Executable()
-	if err != nil {
-		log.Println(err)
-		return 1
-	}
-
-	ex_name := filepath.Base(ex)
-
-	type Command struct {
-		Desc  string
-		Usage string
-		Doc   string
-	}
-
+func get_commands() map[string]Command {
 	// TODO: Make so that LIST can differentiate the variant palettes
-	cmd_names := [...]string{"identify", "remap", "list"}
+	// TODO: Complete the documentation of each command
 	cmds := map[string]Command{
-		cmd_names[0]: {
+		IDENTIFY: {
 			Desc:  "analyzes an image and identifies the color palette used",
-			Usage: fmt.Sprintf("%s %s <image> [palette...]", ex_name, cmd_names[0]),
+			Usage: fmt.Sprintf("%s %s <image> [palette...]", ex, IDENTIFY),
 			Doc: fmt.Sprintf(strings.TrimSuffix(strings.ReplaceAll(`
 					Analyzes an image and identifies the color palette used.
-					The output is the found color palette name in the default palette list,
+					The output is the found color palette in the default palette list,
 					this list can be shown with '%s %s'.
 					Optionally, you may enter one or more palettes to match instead of the
 					default palette list.
-				`, "\t", ""), "\n"), ex_name, cmd_names[2])[1:],
+				`, "\t", ""), "\n"), ex, IDENTIFY)[1:],
 		},
-		cmd_names[1]: {
+		REMAP: {
 			Desc:  "replaces the colors in a image using a color palette",
-			Usage: fmt.Sprintf("%s %s <image> [flags] <palette> <output_image>", ex_name, cmd_names[1]),
+			Usage: fmt.Sprintf("%s %s <image> [flags] <palette> <output_image>", ex, REMAP),
 			Doc: strings.TrimSuffix(strings.ReplaceAll(`
 					Replaces the colors in a image using a color palette
 				`, "\t", ""), "\n")[1:],
 		},
-		cmd_names[2]: {
+		LIST: {
 			Desc:  "displays the default palette list",
-			Usage: fmt.Sprintf("%s %s", ex_name, cmd_names[2]),
+			Usage: fmt.Sprintf("%s %s", ex, LIST),
 			Doc: strings.TrimSuffix(strings.ReplaceAll(`
 					Displays the default palette list
 				`, "\t", ""), "\n")[1:],
 		},
 	}
-	get_cmd_list := func(cmds map[string]Command) []string {
-		output := make([]string, 0, len(cmds))
+	return cmds
+}
 
-		max_padding := 0
-		for k := range cmds {
-			if len(k) > max_padding {
-				max_padding = len(k)
-			}
+func get_help(cmds map[string]Command) string {
+	cmd_list := make([]string, 0, len(cmds))
+
+	max_padding := 0
+	for k := range cmds {
+		if len(k) > max_padding {
+			max_padding = len(k)
 		}
-
-		for k, cmd := range cmds {
-			output = append(output, k+strings.Repeat(" ", max_padding-len(k)+2)+cmd.Desc)
-		}
-
-		sort.Strings(output)
-		return output
 	}
 
-	help := strings.TrimSuffix(fmt.Sprintf(`
+	for k, cmd := range cmds {
+		cmd_list = append(cmd_list, k+strings.Repeat(" ", max_padding-len(k)+2)+cmd.Desc)
+	}
+
+	sort.Strings(cmd_list)
+
+	return strings.TrimSuffix(fmt.Sprintf(`
 Nespal is a tool for manipulating images using color palettes from the Nintendo Entertainment System (NES) emulation ecosystem
 
 Usage: %s <command> <image>... [options] [output]
@@ -230,25 +250,30 @@ Usage: %s <command> <image>... [options] [output]
 The commands are:
 	%s
 
-Use "%s help <command>" for more information about a command
-	`, ex_name, strings.Join(get_cmd_list(cmds), "\n\t"), ex_name), "\n\t")[1:]
+Use "%s %s <command>" for more information about a command
+	`, ex, strings.Join(cmd_list, "\n\t"), ex, HELP), "\n\t")[1:]
+}
 
-	try_help := fmt.Sprintf("Try: %s help", ex_name)
+func run() int {
+	cmds := get_commands()
+	help := get_help(cmds)
+	try_help := fmt.Sprintf("Try: %s %s", ex, HELP)
+	args := os.Args[1:]
 
-	if len(os.Args) == 1 {
+	if len(args) == 0 {
 		println(help)
-		log.Printf("\n%s: missing command\n", ex_name)
+		log.Printf("\n%s: missing command\n", ex)
 		return 2
 	}
 
-	if _, ok := cmds[os.Args[1]]; !ok && os.Args[1] != "help" {
-		log.Printf("%s: unknown command \"%s\"\n", ex_name, os.Args[1])
+	if _, ok := cmds[args[0]]; !ok && args[0] != HELP {
+		log.Printf("%s: unknown command \"%s\"\n", ex, os.Args[1])
 		log.Printf(try_help)
 		return 2
 	}
 
-	load_image := func(filename string) (image.Image, error) {
-		sourcef, err := os.Open(filename)
+	load_image := func(fil string) (image.Image, error) {
+		sourcef, err := os.Open(fil)
 		if err != nil {
 			sourcef.Close()
 			return nil, err
@@ -263,8 +288,160 @@ Use "%s help <command>" for more information about a command
 		return source, nil
 	}
 
-	switch os.Args[1] {
-	case "help":
+	switch args[0] {
+	case IDENTIFY:
+		custom_only := pflag.BoolP("custom-only", "c", false, "Only match against input color palettes")
+		pflag.Parse()
+		args = pflag.Args()
+
+		if len(args) == 1 {
+			log.Printf("%s: missing image file\n", ex)
+			return 2
+		}
+
+		source, err := load_image(args[1])
+		if err != nil {
+			log.Println(err)
+			return 1
+		}
+		custom_pals := make([]*os.File, len(args)-2)
+		for i := range custom_pals {
+			path := args[i+2]
+			if filepath.Ext(path) != ".pal" {
+				log.Printf("%s: usupported palette file format for '%s', expected '.pal'\n", ex, os.Args[3])
+				return 2
+			}
+
+			file, err := os.Open(path)
+			if err != nil {
+				log.Println(err)
+				return 1
+			}
+			custom_pals[i] = file
+		}
+
+		if status, err := identify(source, custom_pals, *custom_only); err != nil {
+			log.Println(err)
+			return status
+		}
+	case REMAP:
+		chosen_pal := pflag.StringP("palette", "p", "", "Color palette to remap image to")
+		pflag.Parse()
+		args = pflag.Args()
+
+		if len(args) == 1 {
+			log.Printf("%s: missing image file\n", ex)
+			return 2
+		}
+
+		source, err := load_image(args[1])
+		if err != nil {
+			log.Println(err)
+			return 1
+		}
+
+		if *chosen_pal != "" {
+			res := make([]rune, 0, len(*chosen_pal))
+			for _, r := range *chosen_pal {
+				if !unicode.IsSpace(r) {
+					res = append(res, r)
+				}
+			}
+			if string(res) == "" {
+				log.Printf("%s: empty value for '--palette' flag", ex)
+				return 2
+			}
+
+			if strings.Contains(*chosen_pal, ".") {
+				log.Printf("%s: invalid value '%s' for '--palette' flag", ex, *chosen_pal)
+				return 2
+			}
+
+			var pal fs.File = nil
+			entries, err := fs.ReadDir(palettes, "palettes")
+			if err != nil {
+				log.Println(err)
+				return 1
+			}
+
+			for _, d := range entries {
+				if d.IsDir() {
+					continue
+				}
+
+				if strings.HasSuffix(d.Name(), ".pal") && strings.EqualFold(*chosen_pal, strings.TrimSuffix(d.Name(), ".pal")) {
+					pal, err = palettes.Open(filepath.Join("palettes", d.Name()))
+					if err != nil {
+						log.Println(err)
+						return 1
+					}
+				}
+			}
+
+			if pal == nil {
+				log.Printf("%s: palette '%s' not in the palette list", ex, *chosen_pal)
+				return 2
+			}
+
+			if len(args) == 2 {
+				log.Printf("%s: missing output image\n", ex)
+				return 2
+			}
+
+			if status, err := remap(source, pal, args[2]); err != nil {
+				log.Println(err)
+				return status
+			}
+			return 0
+		}
+
+		if len(args) == 2 {
+			log.Printf("%s: missing color palette\n", ex)
+			return 2
+		}
+
+		if filepath.Ext(args[2]) != ".pal" {
+			log.Printf("%s: usupported palette file format for '%s', expected '.pal'\n", ex, args[2])
+			return 2
+		}
+
+		if len(args) == 3 {
+			log.Printf("%s: missing output image\n", ex)
+			return 2
+		}
+
+		input_pal, err := os.Open(args[2])
+		if err != nil {
+			log.Println(err)
+			return 1
+		}
+
+		if status, err := remap(source, input_pal, args[3]); err != nil {
+			log.Println(err)
+			return status
+		}
+	case LIST:
+		if err := fs.WalkDir(palettes, ".", func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			if d.IsDir() {
+				return nil
+			}
+
+			pal, found := strings.CutSuffix(d.Name(), ".pal")
+			if !found {
+				return nil
+			}
+			println(pal)
+
+			return nil
+		}); err != nil {
+			log.Println(err)
+			return 1
+		}
+	case HELP:
 		if len(os.Args) == 2 {
 			println(help)
 			return 0
@@ -272,7 +449,7 @@ Use "%s help <command>" for more information about a command
 
 		cmd, ok := cmds[os.Args[2]]
 		if !ok {
-			log.Printf("%s: unknown help topic \"%s\"\n", ex_name, os.Args[2])
+			log.Printf("%s: unknown help topic \"%s\"\n", ex, os.Args[2])
 			log.Println(try_help)
 			return 2
 		}
@@ -280,58 +457,14 @@ Use "%s help <command>" for more information about a command
 		fmt.Printf("Usage: %s\n\n", cmd.Usage)
 		println(cmd.Doc)
 		return 0
-	case cmd_names[0]:
-		source, err := load_image(os.Args[2])
-		if err != nil {
-			log.Println(err)
-			return 1
-		}
-
-		status, err := identify(source)
-		if err != nil {
-			log.Println(err)
-			return status
-		}
-	case cmd_names[1]:
-		source, err := load_image(os.Args[2])
-		if err != nil {
-			log.Println(err)
-			return 1
-		}
-
-		if len(os.Args) < 4 {
-			log.Printf("%s: missing color palette\n", ex_name)
-			return 2
-		}
-
-		if filepath.Ext(os.Args[3]) != ".pal" {
-			log.Printf("%s: nsupported palette file format for '%s', expected '.pal'\n", ex_name, os.Args[3])
-			return 2
-		}
-
-		status, err := remap(source)
-		if err != nil {
-			log.Println(err)
-			return status
-		}
-	case cmd_names[2]:
-		if err = fs.WalkDir(palettes, ".", func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-
-			if !d.IsDir() {
-				println(filepath.Base(path))
-			}
-
-			return nil
-		}); err != nil {
-			log.Println(err)
-			return 1
-		}
 	}
 
 	return 0
+}
+
+func init() {
+	log.SetFlags(0)
+	ex = filepath.Base(os.Args[0])
 }
 
 func main() {
